@@ -38,8 +38,8 @@ def main() -> int:
     log.info("configured for a %d-link arm", n_links)
 
     broker = Broker()
-    providers = arm_sim_node.register(broker)
-    log.info("registered built-in services: %s", ", ".join(p.id for p in providers))
+    stoppables, _runtime = arm_sim_node.register(broker, n_links)
+    log.info("registered: %s", ", ".join(s.id for s in stoppables))
 
     server = TCPServer(broker)
     try:
@@ -59,8 +59,8 @@ def main() -> int:
     try:
         server.serve_forever()
     finally:
-        for provider in providers:
-            provider.stop()
+        for stoppable in stoppables:
+            stoppable.stop()
     log.info("shutdown complete")
     return 0
 
