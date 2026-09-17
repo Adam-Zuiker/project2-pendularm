@@ -4,12 +4,11 @@ one lock — the same "lock only for bookkeeping, never for I/O" discipline
 broker.py's Broker uses (see that module's docstring for the full argument;
 it applies unchanged here).
 
-PID control (tau) isn't wired in yet: `step()` always applies zero effort,
-which is exactly the spec's "PID starts disabled by default" behavior —
-you should see the arm swing freely under gravity as soon as dynamics.py
-is filled in, with no controller involved yet. arm_lib/pid.py's TODO(human)
-section will replace the `tau = [0.0] * self._n` line below with real PID
-effort.
+`step()` applies zero effort whenever the PID controller is disabled —
+which is exactly the spec's "PID starts disabled by default" behavior, so
+the arm swings freely under gravity until a client explicitly enables
+control. The controller itself (`arm_lib.pid.PidController`) is owned here
+and protected by the same lock as everything else in this class.
 """
 
 from __future__ import annotations
@@ -19,6 +18,7 @@ from typing import List, Optional, Tuple
 
 from arm_lib import dynamics, linalg
 from arm_lib.integrators import INTEGRATORS
+from arm_lib.pid import PidController
 
 Vector = List[float]
 
@@ -47,6 +47,8 @@ class ArmRuntime:
         # should visibly move as soon as the runtime starts" holds.
         self._q: Vector = [0.0] * n_links
         self._qdot: Vector = [0.0] * n_links
+        self._last_effort: Vector = [0.0] * n_links
+        self._pid = PidController(n_links)
 
     @property
     def n_links(self) -> int:
@@ -74,9 +76,9 @@ class ArmRuntime:
                 self._paused = paused
             return self._paused
 
-    def get_joint_state(self) -> Tuple[float, Vector, Vector]:
+    def get_joint_state(self) -> Tuple[float, Vector, Vector, Vector]:
         with self._lock:
-            return self._t, list(self._q), list(self._qdot)
+            return self._t, list(self._q), list(self._qdot), list(self._last_effort)
 
     def get_params(self) -> Tuple[Vector, Vector, float]:
         with self._lock:
@@ -142,11 +144,39 @@ class ArmRuntime:
             self._q = [0.0] * self._n
             self._qdot = [0.0] * self._n
             self._t = 0.0
-            # TODO (arrives with arm_lib/pid.py): also reset the PID
-            # controller's integral/setpoint here, per the spec — a plant
-            # reset that leaves the controller chasing its old setpoint
-            # would immediately pull the arm away from home again.
+            self._pid.reset()
             return list(self._q), list(self._qdot)
+
+    # -- PID -------------------------------------------------------------
+
+    def is_pid_enabled(self) -> bool:
+        with self._lock:
+            return self._pid.is_enabled()
+
+    def enable_pid(self, enabled: Optional[bool]) -> bool:
+        """`enabled=None` queries without changing anything (the spec's
+        empty-request convention, same as set_pause)."""
+        with self._lock:
+            if enabled is not None:
+                self._pid.enable(enabled)
+            return self._pid.is_enabled()
+
+    def get_pid_gains(self) -> Tuple[Vector, Vector, Vector]:
+        with self._lock:
+            return self._pid.get_gains()
+
+    def set_pid_gains(
+        self,
+        kp: Optional[Vector] = None,
+        ki: Optional[Vector] = None,
+        kd: Optional[Vector] = None,
+    ) -> Tuple[Vector, Vector, Vector, List[str]]:
+        with self._lock:
+            return self._pid.set_gains(kp, ki, kd)
+
+    def set_joint_trajectory_setpoint(self, positions: Vector, velocities: Vector) -> None:
+        with self._lock:
+            self._pid.set_setpoint(positions, velocities)
 
     def step(self) -> None:
         """Advance the simulation by exactly one configured timestep.
@@ -158,7 +188,10 @@ class ArmRuntime:
             integrator_name, dt = self._integrator_name, self._dt
             t, q, qdot = self._t, self._q, self._qdot
 
-            tau = [0.0] * self._n  # replaced by PID effort once pid.py lands
+            if self._pid.is_enabled():
+                tau = self._pid.compute_effort(q, qdot, dt)
+            else:
+                tau = [0.0] * self._n
 
             def qddot_func(t_eval: float, q_eval: Vector, qdot_eval: Vector) -> Vector:
                 mass_matrix = dynamics.mass_matrix(masses, lengths, q_eval)
@@ -173,6 +206,7 @@ class ArmRuntime:
             self._q = q_next
             self._qdot = qdot_next
             self._t = t + dt
+            self._last_effort = tau
 
 
 def _not_positive_number(value: object) -> bool:

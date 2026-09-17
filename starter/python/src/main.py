@@ -16,6 +16,9 @@ import signal
 import sys
 
 import arm_sim_node
+import ik_action_node
+import ik_node
+import ik_trial_node
 import logging_setup
 from broker import Broker
 from server import TCPServer
@@ -38,7 +41,12 @@ def main() -> int:
     log.info("configured for a %d-link arm", n_links)
 
     broker = Broker()
-    stoppables, _runtime = arm_sim_node.register(broker, n_links)
+    stoppables, runtime = arm_sim_node.register(broker, n_links)
+    stoppables += ik_node.register(broker, runtime)
+    ik_action_providers, ik_action_manager = ik_action_node.register(broker, runtime)
+    stoppables += ik_action_providers
+    ik_trial_stoppables, _ik_trial = ik_trial_node.register(broker, runtime, ik_action_manager)
+    stoppables += ik_trial_stoppables
     log.info("registered: %s", ", ".join(s.id for s in stoppables))
 
     server = TCPServer(broker)
