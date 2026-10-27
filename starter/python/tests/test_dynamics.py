@@ -1,211 +1,184 @@
-"""Checks arm_lib.dynamics against independently-computed physics rather
-than any specific reference formula for M/C/G — per the spec, "no need to
-match any particular exact C(q,qdot) matrix... only the observable
-coupling behavior matters." Four independent checks:
-
-  1. M(q) is symmetric and positive-definite (physically required for any
-     valid arm — positive masses/lengths).
-  2. M(q) is consistent with a kinetic energy computed a totally different
-     way: per-link translational + rotational KE, with link-COM velocity
-     obtained by numerically differentiating COM position (not by using
-     M at all).
-  3. G(q) matches the numerical gradient of a potential energy computed
-     the same independent way (sum of m*g*y_com per link).
-  4. A free (tau=0), undamped rollout conserves total mechanical energy —
-     this only holds if M, C, and G are all mutually consistent, so it
-     exercises the Coriolis term (the one piece the other checks don't
-     touch directly) along with inter-joint coupling.
-
-Run with: python3 -m unittest tests.test_dynamics -v
-"""
-
-from __future__ import annotations
+"""Lagrangian dynamics checks (src/arm_lib/dynamics.py, linalg.py), run without the
+runtime. Expected values come from textbook closed forms or from energy computed
+independently of dynamics.py."""
 
 import math
 import os
 import random
 import sys
-import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 from arm_lib import dynamics, linalg
 from arm_lib.integrators import rk4_step
 
-EPS = 1e-6
 
-
-def link_com_positions(lengths, q):
-    """Independent forward kinematics: world (x, y) of each link's center
-    of mass. Does not use arm_lib.dynamics at all."""
-    n = len(lengths)
-    phi = 0.0
-    joint_x, joint_y = 0.0, 0.0
-    coms = []
-    for i in range(n):
-        phi += q[i]
-        com_x = joint_x + 0.5 * lengths[i] * math.cos(phi)
-        com_y = joint_y + 0.5 * lengths[i] * math.sin(phi)
-        coms.append((com_x, com_y))
-        joint_x += lengths[i] * math.cos(phi)
-        joint_y += lengths[i] * math.sin(phi)
+def _com_positions(lengths, q):
+    phi, jx, jy, coms = 0.0, 0.0, 0.0, []
+    for length, qi in zip(lengths, q):
+        phi += qi
+        coms.append((jx + 0.5 * length * math.cos(phi), jy + 0.5 * length * math.sin(phi)))
+        jx += length * math.cos(phi)
+        jy += length * math.sin(phi)
     return coms
 
 
-def potential_energy(masses, lengths, q, gravity):
-    coms = link_com_positions(lengths, q)
-    return sum(m * gravity * y for m, (_, y) in zip(masses, coms))
-
-
-def kinetic_energy_independent(masses, lengths, q, qdot):
-    """KE via per-link translational + rotational energy, with COM
-    velocity from central finite differences on link_com_positions —
-    deliberately not going through arm_lib.dynamics.mass_matrix."""
-    n = len(lengths)
-
-    def coms_at(scale):
-        q_perturbed = [qi + scale * EPS * qdoti for qi, qdoti in zip(q, qdot)]
-        return link_com_positions(lengths, q_perturbed)
-
-    coms_plus = coms_at(1.0)
-    coms_minus = coms_at(-1.0)
-
-    total = 0.0
-    phidot = 0.0
-    for i in range(n):
-        vx = (coms_plus[i][0] - coms_minus[i][0]) / (2 * EPS)
-        vy = (coms_plus[i][1] - coms_minus[i][1]) / (2 * EPS)
-        translational = 0.5 * masses[i] * (vx * vx + vy * vy)
+def _independent_energy(masses, lengths, q, qdot, gravity):
+    h = 1e-6
+    plus = _com_positions(lengths, [qi + h * vi for qi, vi in zip(q, qdot)])
+    minus = _com_positions(lengths, [qi - h * vi for qi, vi in zip(q, qdot)])
+    kinetic, potential, phidot = 0.0, 0.0, 0.0
+    for i, (m, length) in enumerate(zip(masses, lengths)):
         phidot += qdot[i]
-        moment_of_inertia = masses[i] * lengths[i] ** 2 / 12.0
-        rotational = 0.5 * moment_of_inertia * phidot * phidot
-        total += translational + rotational
-    return total
+        vx = (plus[i][0] - minus[i][0]) / (2 * h)
+        vy = (plus[i][1] - minus[i][1]) / (2 * h)
+        kinetic += 0.5 * m * (vx * vx + vy * vy) + 0.5 * (m * length * length / 12.0) * phidot * phidot
+    for m, (_, y) in zip(masses, _com_positions(lengths, q)):
+        potential += m * gravity * y
+    return kinetic, potential
 
 
-def quadratic_form(matrix, vector):
-    n = len(vector)
-    return sum(vector[i] * matrix[i][j] * vector[j] for i in range(n) for j in range(n))
+def _close(a, b, tol):
+    return abs(a - b) <= tol * max(1.0, abs(b))
 
 
-class TestMassMatrix(unittest.TestCase):
-    MASSES = [1.2, 0.8, 1.5]
-    LENGTHS = [0.9, 0.6, 1.1]
+def test_mass_matrix_matches_closed_form_for_one_and_two_links():
+    for m, length, q in ((2.0, 1.5, 0.3), (0.7, 0.4, -2.0)):
+        got = dynamics.mass_matrix([m], [length], [q])
+        assert _close(got[0][0], m * length ** 2 / 3.0, 1e-9), f"1-link M({m}, {length}) = {got}, expected m*l^2/3"
 
-    def configurations(self):
-        rng = random.Random(0)
+    m1, m2, l1, l2 = 1.3, 0.6, 1.1, 0.8
+    for q in ([0.0, 0.0], [0.4, 1.2], [-1.0, -2.5], [2.0, math.pi]):
+        c2 = math.cos(q[1])
+        expected = [
+            [m1 * l1 ** 2 / 3 + m2 * (l1 ** 2 + l2 ** 2 / 3 + l1 * l2 * c2), m2 * (l2 ** 2 / 3 + l1 * l2 * c2 / 2)],
+            [m2 * (l2 ** 2 / 3 + l1 * l2 * c2 / 2), m2 * l2 ** 2 / 3],
+        ]
+        got = dynamics.mass_matrix([m1, m2], [l1, l2], q)
+        for i in range(2):
+            for j in range(2):
+                assert _close(got[i][j], expected[i][j], 1e-9), \
+                    f"2-link M at q={q}: got {got}, expected {expected} (entry [{i}][{j}])"
+
+
+def test_mass_matrix_is_symmetric_positive_definite():
+    rng = random.Random(511)
+    for n in (2, 3, 4):
         for _ in range(5):
-            yield [rng.uniform(-math.pi, math.pi) for _ in self.MASSES]
-
-    def test_symmetric_and_positive_definite(self):
-        rng = random.Random(1)
-        for q in self.configurations():
-            m = dynamics.mass_matrix(self.MASSES, self.LENGTHS, q)
-            n = len(m)
+            masses = [rng.uniform(0.2, 3.0) for _ in range(n)]
+            lengths = [rng.uniform(0.2, 2.0) for _ in range(n)]
+            q = [rng.uniform(-math.pi, math.pi) for _ in range(n)]
+            M = dynamics.mass_matrix(masses, lengths, q)
+            assert len(M) == n and all(len(row) == n for row in M), f"M has wrong shape for n={n}: {M}"
             for i in range(n):
                 for j in range(n):
-                    self.assertAlmostEqual(m[i][j], m[j][i], places=9, msg=f"M not symmetric at q={q}")
-            for _ in range(5):
-                x = [rng.uniform(-2, 2) for _ in range(n)]
-                if all(abs(xi) < 1e-9 for xi in x):
-                    continue
-                self.assertGreater(quadratic_form(m, x), 0.0, msg=f"M not positive-definite at q={q}, x={x}")
-
-    def test_matches_independent_kinetic_energy(self):
-        rng = random.Random(2)
-        for q in self.configurations():
-            qdot = [rng.uniform(-1.5, 1.5) for _ in self.MASSES]
-            m = dynamics.mass_matrix(self.MASSES, self.LENGTHS, q)
-            ke_from_m = 0.5 * quadratic_form(m, qdot)
-            ke_independent = kinetic_energy_independent(self.MASSES, self.LENGTHS, q, qdot)
-            self.assertAlmostEqual(ke_from_m, ke_independent, places=4, msg=f"q={q}, qdot={qdot}")
+                    assert _close(M[i][j], M[j][i], 1e-9), f"M not symmetric at [{i}][{j}]: {M}"
+            L = [[0.0] * n for _ in range(n)]
+            for i in range(n):
+                for j in range(i + 1):
+                    s = M[i][j] - sum(L[i][k] * L[j][k] for k in range(j))
+                    if i == j:
+                        assert s > 1e-9, f"M not positive-definite (Cholesky pivot {s}) for {masses}, {lengths}, {q}: {M}"
+                        L[i][i] = math.sqrt(s)
+                    else:
+                        L[i][j] = s / L[j][j]
 
 
-class TestGravityVector(unittest.TestCase):
-    MASSES = [1.2, 0.8, 1.5]
-    LENGTHS = [0.9, 0.6, 1.1]
-    GRAVITY = 9.81
-
-    def test_matches_numerical_gradient_of_potential_energy(self):
-        rng = random.Random(3)
+def test_mass_matrix_matches_independent_kinetic_energy():
+    rng = random.Random(42)
+    for n in (2, 3):
         for _ in range(5):
-            q = [rng.uniform(-math.pi, math.pi) for _ in self.MASSES]
-            g = dynamics.gravity_vector(self.MASSES, self.LENGTHS, q, self.GRAVITY)
-            for i in range(len(q)):
-                q_plus = list(q)
-                q_minus = list(q)
-                q_plus[i] += EPS
-                q_minus[i] -= EPS
-                v_plus = potential_energy(self.MASSES, self.LENGTHS, q_plus, self.GRAVITY)
-                v_minus = potential_energy(self.MASSES, self.LENGTHS, q_minus, self.GRAVITY)
-                expected = (v_plus - v_minus) / (2 * EPS)
-                self.assertAlmostEqual(g[i], expected, places=3, msg=f"q={q}, joint {i}")
+            masses = [rng.uniform(0.3, 2.5) for _ in range(n)]
+            lengths = [rng.uniform(0.3, 1.8) for _ in range(n)]
+            q = [rng.uniform(-math.pi, math.pi) for _ in range(n)]
+            qdot = [rng.uniform(-2.0, 2.0) for _ in range(n)]
+            M = dynamics.mass_matrix(masses, lengths, q)
+            ke_from_m = 0.5 * sum(qdot[i] * M[i][j] * qdot[j] for i in range(n) for j in range(n))
+            ke_true, _ = _independent_energy(masses, lengths, q, qdot, 0.0)
+            assert _close(ke_from_m, ke_true, 1e-6), \
+                f"0.5 qdot^T M qdot = {ke_from_m} but independent KE = {ke_true} for n={n}, q={q}, qdot={qdot}"
 
 
-class TestCoriolisCoupling(unittest.TestCase):
-    def test_joint_velocity_affects_other_joints_acceleration(self):
-        """Spec: 'a 3-link arm should couple more strongly than a 2-link
-        one' — at minimum, moving one joint should perturb another joint's
-        C(q,qdot)@qdot term. Isolates C by holding q fixed (so M and G
-        don't change) and comparing two different qdot vectors."""
-        for n in (2, 3):
-            masses = [1.0] * n
-            lengths = [1.0] * n
-            q = [0.4] * n
-            qdot_zero = [0.0] * n
-            qdot_joint0 = [0.0] * n
-            qdot_joint0[0] = 2.0
-
-            c_zero = dynamics.coriolis_forces(masses, lengths, q, qdot_zero)
-            c_joint0 = dynamics.coriolis_forces(masses, lengths, q, qdot_joint0)
-
-            other_joint_changed = any(
-                abs(c_joint0[j] - c_zero[j]) > 1e-9 for j in range(1, n)
-            )
-            self.assertTrue(
-                other_joint_changed,
-                msg=f"n={n}: moving joint 0 (qdot={qdot_joint0}) had no effect on any "
-                f"other joint's Coriolis term ({c_zero} -> {c_joint0}) — is C actually wired in?",
-            )
+def test_gravity_vector_matches_two_link_closed_form():
+    m1, m2, l1, l2 = 1.3, 0.6, 1.1, 0.8
+    for g in (9.81, 3.7, 0.0):
+        for q in ([0.0, 0.0], [0.4, 1.2], [-math.pi / 2, 0.0], [2.0, -0.7]):
+            c1, c12 = math.cos(q[0]), math.cos(q[0] + q[1])
+            expected = [g * ((m1 * l1 / 2 + m2 * l1) * c1 + m2 * l2 / 2 * c12), g * m2 * l2 / 2 * c12]
+            got = dynamics.gravity_vector([m1, m2], [l1, l2], q, g)
+            assert all(abs(a - b) < 1e-9 for a, b in zip(got, expected)) and len(got) == 2, \
+                f"G at q={q}, g={g}: got {got}, expected {expected}"
 
 
-class TestEnergyConservation(unittest.TestCase):
-    def test_free_swing_conserves_energy(self):
-        masses = [1.0, 0.8]
-        lengths = [1.0, 0.8]
-        gravity = 9.81
-        q = [1.2, -0.6]
-        qdot = [0.0, 0.0]
-        dt = 0.001
-        steps = 500  # 0.5s
-
-        def qddot_func(t, q_eval, qdot_eval):
-            m = dynamics.mass_matrix(masses, lengths, q_eval)
-            c = dynamics.coriolis_forces(masses, lengths, q_eval, qdot_eval)
-            g = dynamics.gravity_vector(masses, lengths, q_eval, gravity)
-            rhs = linalg.vec_sub(linalg.vec_sub([0.0] * len(q_eval), c), g)
-            return linalg.solve_linear_system(m, rhs)
-
-        def total_energy(q_eval, qdot_eval):
-            m = dynamics.mass_matrix(masses, lengths, q_eval)
-            ke = 0.5 * quadratic_form(m, qdot_eval)
-            pe = potential_energy(masses, lengths, q_eval, gravity)
-            return ke + pe
-
-        e_initial = total_energy(q, qdot)
-        t = 0.0
-        for _ in range(steps):
-            q, qdot = rk4_step(qddot_func, t, q, qdot, dt)
-            t += dt
-        e_final = total_energy(q, qdot)
-
-        relative_change = abs(e_final - e_initial) / abs(e_initial)
-        self.assertLess(
-            relative_change, 1e-3,
-            msg=f"energy drifted from {e_initial} to {e_final} over a free swing "
-            "— M/C/G are likely inconsistent with each other",
-        )
+def test_gravity_vector_matches_potential_energy_gradient():
+    rng = random.Random(7)
+    h = 1e-6
+    for _ in range(5):
+        n = 3
+        masses = [rng.uniform(0.3, 2.5) for _ in range(n)]
+        lengths = [rng.uniform(0.3, 1.8) for _ in range(n)]
+        q = [rng.uniform(-math.pi, math.pi) for _ in range(n)]
+        gravity = rng.uniform(1.0, 12.0)
+        got = dynamics.gravity_vector(masses, lengths, q, gravity)
+        for i in range(n):
+            qp, qm = list(q), list(q)
+            qp[i] += h
+            qm[i] -= h
+            dv = (_independent_energy(masses, lengths, qp, [0.0] * n, gravity)[1]
+                  - _independent_energy(masses, lengths, qm, [0.0] * n, gravity)[1]) / (2 * h)
+            assert abs(got[i] - dv) < 1e-5, f"G[{i}] = {got[i]} but dV/dq{i} = {dv} for q={q}, G={got}"
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_coriolis_matches_two_link_closed_form_and_vanishes_at_rest():
+    m1, m2, l1, l2 = 1.3, 0.6, 1.1, 0.8
+    for q, qdot in (([0.4, 1.2], [0.7, -1.5]), ([-1.0, -2.5], [2.0, 0.3]), ([0.0, 0.9], [-1.1, 1.1])):
+        h = m2 * l1 * (l2 / 2) * math.sin(q[1])
+        expected = [-h * (2 * qdot[0] * qdot[1] + qdot[1] ** 2), h * qdot[0] ** 2]
+        got = dynamics.coriolis_forces([m1, m2], [l1, l2], q, qdot)
+        assert all(abs(a - b) < 1e-5 for a, b in zip(got, expected)) and len(got) == 2, \
+            f"C(q,qdot)qdot at q={q}, qdot={qdot}: got {got}, expected {expected}"
+
+    masses, lengths, q = [1.0, 0.7, 0.5], [1.0, 0.8, 0.6], [0.3, -0.4, 0.5]
+    at_rest = dynamics.coriolis_forces(masses, lengths, q, [0.0, 0.0, 0.0])
+    assert all(abs(v) < 1e-9 for v in at_rest), f"Coriolis with qdot=0 should be 0, got {at_rest}"
+    qdot = [0.5, -0.2, 1.1]
+    once = dynamics.coriolis_forces(masses, lengths, q, qdot)
+    twice = dynamics.coriolis_forces(masses, lengths, q, [2 * v for v in qdot])
+    assert any(abs(v) > 1e-3 for v in once), f"3-link Coriolis unexpectedly ~0 for qdot={qdot}: {once}"
+    assert all(abs(b - 4 * a) < 1e-5 for a, b in zip(once, twice)), \
+        f"Coriolis must be quadratic in qdot: C(2qdot)={twice} but 4*C(qdot)={[4 * a for a in once]}"
+
+
+def test_free_three_link_rollout_conserves_energy():
+    masses, lengths, gravity = [1.0, 0.7, 0.5], [1.0, 0.8, 0.6], 9.81
+
+    def qddot(t, q, qdot):
+        M = dynamics.mass_matrix(masses, lengths, q)
+        c = dynamics.coriolis_forces(masses, lengths, q, qdot)
+        g = dynamics.gravity_vector(masses, lengths, q, gravity)
+        return linalg.solve_linear_system(M, [-ci - gi for ci, gi in zip(c, g)])
+
+    q, qdot, dt = [0.3, -0.4, 0.5], [0.5, -0.2, 0.1], 0.002
+    e0 = sum(_independent_energy(masses, lengths, q, qdot, gravity))
+    for k in range(400):
+        q, qdot = rk4_step(qddot, k * dt, q, qdot, dt)
+    e1 = sum(_independent_energy(masses, lengths, q, qdot, gravity))
+    assert abs(q[0] - 0.3) > 0.2, f"arm barely moved under gravity in 0.8 s: q={q}"
+    assert abs(e1 - e0) < 1e-4, f"energy drifted from {e0} to {e1} over a free 0.8 s rollout (final q={q})"
+
+
+def test_solve_linear_system_needs_pivoting_and_leaves_inputs_untouched():
+    a = [[0.0, 2.0, 1.0], [1.0, -1.0, 3.0], [4.0, 1.0, -2.0]]
+    x_true = [1.5, -2.0, 0.75]
+    b = [sum(a[i][j] * x_true[j] for j in range(3)) for i in range(3)]
+    a_copy, b_copy = [list(r) for r in a], list(b)
+    x = linalg.solve_linear_system(a, b)
+    assert all(abs(xi - ti) < 1e-9 for xi, ti in zip(x, x_true)), f"solve_linear_system returned {x}, expected {x_true}"
+    assert a == a_copy and b == b_copy, f"solve_linear_system modified its inputs: a={a}, b={b}"
+    try:
+        x = linalg.solve_linear_system([[1.0, 2.0], [2.0, 4.0]], [1.0, 2.0])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(f"singular matrix should raise ValueError, got {x}")
+    assert linalg.vec_sub([5.0, 1.0], [2.0, 3.0]) == [3.0, -2.0], "vec_sub([5,1],[2,3]) != [3,-2]"

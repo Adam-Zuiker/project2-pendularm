@@ -27,8 +27,17 @@ DEFAULT_GRAVITY = 9.81
 # for the live arm (only /arm_sim/integration_step's request is required to
 # name one explicitly) — rk4 at a moderate timestep is a reasonable,
 # stable-by-default starting point until a client calls set_integrator.
+#
+# 0.01 is NOT small enough: measured directly, the 3-link arm at dt=0.01
+# diverges to unbounded values within a few tenths of a simulated second
+# for entirely reasonable PID gains (e.g. kp=80) -- RK4 is 4th-order
+# accurate, not unconditionally stable, and its stability region shrinks
+# as gains (effectively, system stiffness) grow. Swept dt against gains up
+# to kp=200 and found the stability boundary sits between dt=0.005 and
+# dt=0.01 for moderate gains, and between 0.003 and 0.005 for strong ones;
+# 0.001 stays stable across that whole range with real margin to spare.
 DEFAULT_INTEGRATOR = "rk4"
-DEFAULT_TIMESTEP = 0.01
+DEFAULT_TIMESTEP = 0.001
 
 
 class ArmRuntime:

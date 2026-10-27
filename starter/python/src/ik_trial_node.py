@@ -19,7 +19,6 @@ from __future__ import annotations
 import logging
 import random
 import threading
-import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from arm_runtime import ArmRuntime
@@ -55,7 +54,7 @@ class IkTrialNode:
         self._duration = DEFAULT_DURATION
         self._epsilon: Optional[float] = None
         self._success_hold: Optional[float] = None
-        self._start_time = 0.0
+        self._start_sim_time = 0.0
         self._targets_reached = 0
         self._current_goal_id: Optional[str] = None
         self._target: Optional[Dict[str, float]] = None
@@ -122,7 +121,7 @@ class IkTrialNode:
             self._epsilon = epsilon
             self._success_hold = success_hold
             self._targets_reached = 0
-            self._start_time = time.monotonic()
+            self._start_sim_time = self._manager.get_sim_time()
             self._current_goal_id = None
             self._target = None
             self._error = None
@@ -196,14 +195,21 @@ class IkTrialNode:
         with self._lock:
             if not self._running:
                 return
-            expired = (time.monotonic() - self._start_time) >= self._duration
+            start_sim_time = self._start_sim_time
+        # get_sim_time() is a call into the manager, not something to make
+        # while holding this node's own lock (I/O-adjacent, per the
+        # broker's own "lock for bookkeeping, never while calling out"
+        # discipline).
+        expired = (self._manager.get_sim_time() - start_sim_time) >= self._duration
         if expired:
             self.stop()
 
     def _publish_status(self) -> None:
         with self._lock:
             running = self._running
-            elapsed = (time.monotonic() - self._start_time) if running else 0.0
+            start_sim_time = self._start_sim_time
+        elapsed = (self._manager.get_sim_time() - start_sim_time) if running else 0.0
+        with self._lock:
             msg = {
                 "running": running,
                 "elapsed": elapsed,

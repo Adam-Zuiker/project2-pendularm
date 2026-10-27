@@ -137,6 +137,17 @@ class IkActionManager:
     # -- Called by /ik_action/send_goal, /ik_action/cancel_goal, and
     # directly by ik_trial_node.py acting as an internal client. ---------
 
+    def get_sim_time(self) -> float:
+        """Current simulation clock — the same clock /joint_states's
+        header.stamp carries. For ik_trial_node.py's duration/elapsed
+        tracking: per the spec, timing should be measured against
+        simulation time, not wall-clock time, so real-time factor doesn't
+        affect it. This is a plain Python method call on an object
+        ik_trial_node already holds a direct reference to (same internal-
+        client pattern as send_goal/cancel_goal), not a read of
+        /joint_states itself."""
+        return self._runtime.get_joint_state()[0]
+
     def send_goal(
         self,
         x: float,

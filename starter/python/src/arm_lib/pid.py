@@ -91,11 +91,14 @@ class PidController:
     # — see the spec's "Control law" section for why. This method should
     # both update self._integral in place and return the effort vector.
     #
-    # enable(enabled) sets self._enabled. Per the spec, re-enabling after a
-    # disable clears the integral (whatever accumulated while disabled was
-    # never actually driving anything) — but calling enable(True) while
-    # already enabled shouldn't reset anything mid-run, and enable() should
-    # never touch the setpoint.
+    # enable(enabled) sets self._enabled. Re-enabling after a disable clears
+    # the integral only — per the spec's "Control law" section, stated
+    # twice: "clears out whatever integral accumulated while disabled" and
+    # "should start from a clean integral... leave the integral alone [on
+    # gain changes]". The setpoint is untouched by enable/disable; only
+    # /arm_sim/reset (reset() below) clears it. Calling enable(True) while
+    # already enabled shouldn't reset anything mid-run, only the
+    # disabled->enabled transition itself does.
     #
     # reset() clears both the integral AND the setpoint back to zero — the
     # same all-zero reset pose arm_runtime.py's own reset() snaps (q, qdot)

@@ -79,7 +79,7 @@ def midpoint_step(
 ) -> Tuple[Vector, Vector]:
     dt_mid = dt * 0.5
     q_mid = vec_add(q, vec_scale(qdot, dt_mid))
-    qdot_mid = vec_add(qdot, vec_scale(qddot_func(t + dt, q, qdot), dt_mid))
+    qdot_mid = vec_add(qdot, vec_scale(qddot_func(t, q, qdot), dt_mid))
     qddot_mid = qddot_func(t + dt_mid, q_mid, qdot_mid)
 
     q_next = vec_add(q, vec_scale(qdot_mid, dt))

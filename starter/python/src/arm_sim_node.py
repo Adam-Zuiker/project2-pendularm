@@ -57,9 +57,17 @@ def _integration_step_handler(args: Any) -> Tuple[Any, bool, str]:
         x0 = _require_number(args, "x0")
         xdot0 = _require_number(args, "xdot0", default=0.0)
         dt = _require_number(args, "dt")
-        steps = args.get("steps")
-        if isinstance(steps, bool) or not isinstance(steps, int):
+        steps_raw = args.get("steps")
+        # Accept a float that represents a whole number (e.g. 5.0) as well
+        # as a real int -- JSON itself has no int/float distinction, and a
+        # strict `isinstance(steps, int)` check rejects a perfectly valid
+        # whole-number count just because some client serialized it with a
+        # decimal point. Genuinely fractional values (5.5) are still rejected.
+        if isinstance(steps_raw, bool) or not isinstance(steps_raw, (int, float)):
             raise ValueError("args.steps must be an integer")
+        if isinstance(steps_raw, float) and not steps_raw.is_integer():
+            raise ValueError("args.steps must be an integer")
+        steps = int(steps_raw)
         integrator_name = args.get("integrator")
         if not isinstance(integrator_name, str):
             raise ValueError("args.integrator must be a string")

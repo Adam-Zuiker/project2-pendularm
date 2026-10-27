@@ -1,110 +1,88 @@
-"""Checks kinematics.solve_ik against the round-trip property the spec
-itself grades on (feeding the result back through forward_kinematics
-reproduces the requested target/orientation) plus the documented
-reachability rejections — never against one specific closed-form formula
-or elbow configuration.
-
-Run with: python3 -m unittest tests.test_kinematics -v
-"""
-
-from __future__ import annotations
+"""Forward/inverse kinematics checks (src/kinematics.py), run without the runtime."""
 
 import math
 import os
-import random
 import sys
-import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 from kinematics import forward_kinematics, solve_ik
 
-
-def _wrap_to_pi(angle: float) -> float:
-    return (angle + math.pi) % (2 * math.pi) - math.pi
+TOL = 1e-6
 
 
-class TestTwoLinkRoundTrip(unittest.TestCase):
-    LENGTHS = [1.2, 0.8]
-
-    def test_reachable_random_targets_round_trip(self):
-        rng = random.Random(0)
-        l1, l2 = self.LENGTHS
-        for _ in range(30):
-            # Sample a target that's reachable by construction: pick two
-            # joint angles, run forward kinematics, and try to solve back
-            # to the same (x, y) -- this can never fail by an unlucky draw.
-            q1 = rng.uniform(-math.pi, math.pi)
-            q2 = rng.uniform(-math.pi, math.pi)
-            x, y, _phi = forward_kinematics(self.LENGTHS, [q1, q2])
-
-            positions = solve_ik(self.LENGTHS, x, y, None)
-            self.assertEqual(len(positions), 2)
-            x2, y2, _phi2 = forward_kinematics(self.LENGTHS, positions)
-            self.assertAlmostEqual(x2, x, places=6, msg=f"target=({x},{y}) got={positions}")
-            self.assertAlmostEqual(y2, y, places=6, msg=f"target=({x},{y}) got={positions}")
-
-    def test_boundary_fully_extended_is_reachable(self):
-        l1, l2 = self.LENGTHS
-        x, y = l1 + l2, 0.0
-        positions = solve_ik(self.LENGTHS, x, y, None)
-        x2, y2, _ = forward_kinematics(self.LENGTHS, positions)
-        self.assertAlmostEqual(x2, x, places=6)
-        self.assertAlmostEqual(y2, y, places=6)
-
-    def test_boundary_fully_folded_is_reachable(self):
-        l1, l2 = self.LENGTHS
-        x, y = abs(l1 - l2), 0.0
-        positions = solve_ik(self.LENGTHS, x, y, None)
-        x2, y2, _ = forward_kinematics(self.LENGTHS, positions)
-        self.assertAlmostEqual(x2, x, places=6)
-        self.assertAlmostEqual(y2, y, places=6)
-
-    def test_target_beyond_full_extension_is_rejected(self):
-        l1, l2 = self.LENGTHS
-        with self.assertRaises(ValueError):
-            solve_ik(self.LENGTHS, l1 + l2 + 0.5, 0.0, None)
-
-    def test_target_inside_inner_radius_is_rejected(self):
-        l1, l2 = self.LENGTHS
-        with self.assertRaises(ValueError):
-            solve_ik(self.LENGTHS, abs(l1 - l2) * 0.5, 0.0, None)
+def _wrap(angle):
+    return math.atan2(math.sin(angle), math.cos(angle))
 
 
-class TestThreeLinkRoundTrip(unittest.TestCase):
-    LENGTHS = [1.0, 0.8, 0.6]
-
-    def test_reachable_random_targets_with_phi_round_trip(self):
-        rng = random.Random(1)
-        for _ in range(30):
-            q = [rng.uniform(-math.pi, math.pi) for _ in self.LENGTHS]
-            x, y, phi = forward_kinematics(self.LENGTHS, q)
-
-            positions = solve_ik(self.LENGTHS, x, y, phi)
-            self.assertEqual(len(positions), 3)
-            x2, y2, phi2 = forward_kinematics(self.LENGTHS, positions)
-            self.assertAlmostEqual(x2, x, places=6, msg=f"target=({x},{y},{phi}) got={positions}")
-            self.assertAlmostEqual(y2, y, places=6, msg=f"target=({x},{y},{phi}) got={positions}")
-            self.assertAlmostEqual(
-                _wrap_to_pi(phi2 - phi), 0.0, places=6, msg=f"target phi={phi} got phi={phi2}"
-            )
-
-    def test_wrist_point_outside_first_two_links_reach_is_rejected(self):
-        # The target itself is reachable on its own (r=2.3 < sum=2.4), but
-        # phi=pi drags the wrist point (target - l3 in the phi direction)
-        # out to r_wrist=2.9, well past l1+l2=1.8 -- this must be rejected
-        # even though the raw target alone would pass the outer-bound check.
-        l1, l2, l3 = self.LENGTHS
-        x, y, phi = 2.3, 0.0, math.pi
-        self.assertLessEqual(math.hypot(x, y), sum(self.LENGTHS))  # sanity: reachable on its own
-        with self.assertRaises(ValueError):
-            solve_ik(self.LENGTHS, x, y, phi)
-
-    def test_target_beyond_full_extension_is_rejected(self):
-        total = sum(self.LENGTHS)
-        with self.assertRaises(ValueError):
-            solve_ik(self.LENGTHS, total + 0.5, 0.0, 0.0)
+def _assert_reaches(lengths, x, y, phi=None):
+    q = solve_ik(lengths, x, y, phi)
+    assert len(q) == len(lengths), f"solve_ik{(lengths, x, y, phi)} returned {len(q)} angles: {q}"
+    fx, fy, fphi = forward_kinematics(lengths, q)
+    assert abs(fx - x) < TOL and abs(fy - y) < TOL, \
+        f"solve_ik{(lengths, x, y, phi)} -> q={q}, but FK(q)=({fx}, {fy}) != ({x}, {y})"
+    if phi is not None:
+        assert abs(_wrap(fphi - phi)) < TOL, \
+            f"solve_ik{(lengths, x, y, phi)} -> q={q}, but FK orientation {fphi} != requested phi {phi}"
+    return q
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_forward_kinematics_known_poses():
+    cases = [
+        ([1.0, 1.0], [0.0, 0.0], (2.0, 0.0, 0.0)),
+        ([1.0, 1.0], [math.pi / 2, 0.0], (0.0, 2.0, math.pi / 2)),
+        ([2.0, 0.5], [0.0, math.pi / 2], (2.0, 0.5, math.pi / 2)),
+        ([1.0, 2.0, 3.0], [0.0, math.pi / 2, math.pi / 2], (-2.0, 2.0, math.pi)),
+        ([1.5, 1.0, 0.5], [math.pi / 6, -math.pi / 3, math.pi / 4],
+         (1.5 * math.cos(math.pi / 6) + math.cos(-math.pi / 6) + 0.5 * math.cos(math.pi / 12),
+          1.5 * math.sin(math.pi / 6) + math.sin(-math.pi / 6) + 0.5 * math.sin(math.pi / 12),
+          math.pi / 12)),
+    ]
+    for lengths, q, expected in cases:
+        got = forward_kinematics(lengths, q)
+        assert all(abs(g - e) < 1e-9 for g, e in zip(got, expected)), \
+            f"forward_kinematics({lengths}, {q}) = {got}, expected {expected}"
+
+
+def test_ik_two_link_round_trips_through_fk():
+    for lengths in ([1.0, 1.0], [1.5, 0.7], [0.6, 1.4]):
+        for x, y in [(1.2, 0.5), (-0.9, 0.8), (0.3, -1.1), (-1.0, -0.4), (0.0, 1.3), (1.0, 0.0)]:
+            _assert_reaches(lengths, x, y)
+
+
+def test_ik_three_link_with_phi_round_trips_through_fk():
+    lengths = [1.0, 0.8, 0.5]
+    for x, y, phi in [(1.2, 0.6, 0.3), (-0.7, 1.0, 2.0), (0.4, -1.3, -1.2), (1.5, 0.0, 0.0), (-1.0, -0.5, math.pi)]:
+        _assert_reaches(lengths, x, y, phi)
+
+
+def test_ik_three_link_without_phi_round_trips_through_fk():
+    lengths = [1.0, 0.8, 0.5]
+    for x, y in [(1.5, 0.7), (-1.2, 0.9), (0.2, -1.8), (2.0, 0.0), (-0.6, -0.6)]:
+        _assert_reaches(lengths, x, y, None)
+
+
+def test_ik_accepts_exact_boundary_targets():
+    _assert_reaches([1.0, 1.0], 2.0, 0.0)
+    _assert_reaches([1.5, 0.7], 0.0, 2.2)
+    _assert_reaches([1.5, 0.7], 0.8, 0.0)
+    _assert_reaches([1.0, 0.8, 0.5], 0.0, 2.3)
+    _assert_reaches([1.0, 0.8, 0.5], 2.3, 0.0, 0.0)
+    _assert_reaches([1.0, 0.8, 0.5], -0.3, 0.0, math.pi)
+
+
+def test_ik_rejects_unreachable_targets():
+    unreachable = [
+        ([1.0, 1.0], 2.5, 0.0, None),
+        ([1.0, 1.0], 0.0, -3.0, None),
+        ([1.5, 0.7], 0.3, 0.3, None),
+        ([1.0, 0.8, 0.5], 2.5, 0.5, None),
+        ([1.0, 0.8, 0.5], 2.0, 0.0, math.pi),
+        ([1.0, 0.4, 0.5], 0.5, 0.0, 0.0),
+    ]
+    for lengths, x, y, phi in unreachable:
+        try:
+            q = solve_ik(lengths, x, y, phi)
+        except ValueError:
+            continue
+        raise AssertionError(f"solve_ik{(lengths, x, y, phi)} should raise ValueError (unreachable) but returned {q}")
